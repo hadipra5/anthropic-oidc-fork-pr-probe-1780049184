@@ -1,0 +1,67 @@
+name: OIDC Fork PR Probe
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Request OIDC token safely
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "event_name=${GITHUB_EVENT_NAME}"
+          echo "repository=${GITHUB_REPOSITORY}"
+          echo "pr_from_fork=${{ github.event.pull_request.head.repo.fork }}"
+          echo "pr_head_repo=${{ github.event.pull_request.head.repo.full_name }}"
+          echo "author_association=${{ github.event.pull_request.author_association }}"
+
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "fork_pr_oidc_request_env_present=true"
+          else
+            echo "fork_pr_oidc_request_env_present=false"
+            exit 0
+          fi
+
+          status="$(curl -sS -o oidc-response.json -w "%{http_code}" \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fapi.anthropic.com" || true)"
+          echo "fork_pr_oidc_request_http_status=${status}"
+
+          node <<'NODE'
+          const fs = require("fs");
+          const body = JSON.parse(fs.readFileSync("oidc-response.json", "utf8"));
+          if (!body.value) {
+            console.log("fork_pr_oidc_token_minted=false");
+            process.exit(0);
+          }
+          const payload = JSON.parse(Buffer.from(body.value.split(".")[1], "base64url").toString("utf8"));
+          console.log("fork_pr_oidc_token_minted=true");
+          for (const key of [
+            "iss",
+            "aud",
+            "sub",
+            "repository",
+            "repository_owner",
+            "ref",
+            "event_name",
+            "workflow",
+            "job_workflow_ref",
+            "actor",
+            "actor_id",
+          ]) {
+            if (payload[key] !== undefined) {
+              console.log(`oidc_claim_${key}=${payload[key]}`);
+            }
+          }
+          NODE
+
